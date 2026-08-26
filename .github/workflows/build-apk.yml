@@ -57,6 +57,29 @@ jobs:
           test -d ${ANDROID_HOME}/ndk/28.2.13676358 && echo "NDK installed: ${ANDROID_HOME}/ndk/28.2.13676358" || (echo "NDK install failed"; exit 1)
           echo "ANDROID_NDK=${ANDROID_HOME}/ndk/28.2.13676358" >> "$GITHUB_ENV"
 
+      - name: Setup release signing
+        # FlClashTier: 用固定发布签名签 APK（否则回落 debug 签名 + .dev 包名，
+        # 每次 CI 构建的密钥都不同，无法覆盖安装）。android/.gitignore 已忽略
+        # *.jks 和 local.properties；密钥与密码存在仓库 Secrets 里。
+        # 缺 secret 时仅警告不失败，保持与旧行为兼容。
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEY_STORE_PASSWORD" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASSWORD" ]; then
+            echo "::warning::Signing secrets missing; APK will use debug signing (com.flclashtier.dev) and cannot overwrite-install."
+            exit 0
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > android/app/keystore.jks
+          {
+            echo "storePassword=$KEY_STORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } >> android/local.properties
+          echo "Release signing configured (keystore $(stat -c%s android/app/keystore.jks) bytes)"
+
       - name: Build APK
         run: |
           if [ "${{ github.event.inputs.target }}" = "all-abi" ]; then
