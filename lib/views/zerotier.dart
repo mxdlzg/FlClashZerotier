@@ -14,13 +14,16 @@ import 'package:path/path.dart' as p;
 /// FlClashTier: ZeroTier 网络设置页（独立栏目）。
 ///
 /// 写入 `HomeDir/zerotier.json`（Go core 在 TUN 启动时读取；改动后重启 VPN 生效）。
-/// 清空 network-id = 禁用 ZeroTier（纯 mihomo 模式，与 M0 行为一致）。
+/// 支持多网络：`"network-ids": ["id1", "id2", ...]`，同一个 ZT 节点同时加入
+/// 全部网络，各自内网流量都走 ZeroTier。清空全部 = 禁用 ZeroTier（纯 mihomo
+/// 模式，与 M0 行为一致）。旧版单 `network-id` 配置自动兼容读取。
 ///
 /// 私有 Planet（自建根服务器）：
 /// - planet 文件保存到 `HomeDir/zerotier-planet.custom`；
 /// - `zerotier.json` 增加 `"use-custom-planet": true`；
 /// - Go core StartEngine 在创建 ZT 节点前把该文件装入 C wrapper，
-///   ZT core 的 stateGet(PLANET) 将返回私有 planet 而非内置官方 planet。
+///   ZT core 的 stateGet(PLANET) 将返回私有 planet 而非内置官方 planet；
+/// - planet 是节点级的：所有已加入网络共用同一个 planet。
 class ZeroTierView extends ConsumerStatefulWidget {
   const ZeroTierView({super.key});
 
@@ -32,13 +35,17 @@ class _ZeroTierViewState extends ConsumerState<ZeroTierView> {
   /// Planet 文件头校验：world type 0x01 = planet（0x02 = moon）。
   static const int _planetMaxBytes = 8192;
 
+  /// ZeroTier Network ID 必须是 16 位十六进制。
+  static final RegExp _nwidRegExp = RegExp(r'^[0-9a-fA-F]{16}$');
+
   /// 路由模式取值（写入 zerotier.json 的 route-mode，与 Go core 一一对应）。
   static const String _modeClash = 'clash';
   static const String _modeZerotier = 'zerotier';
   static const String _modeCoexist = 'coexist';
   static const String _modeClashOverZerotier = 'clash-over-zerotier';
 
-  final _controller = TextEditingController();
+  /// 每个已配置网络一个输入框（动态增删）。
+  final List<TextEditingController> _nwidControllers = [];
   Timer? _debounce;
   String _status = '';
 
@@ -56,7 +63,9 @@ class _ZeroTierViewState extends ConsumerState<ZeroTierView> {
   @override
   void dispose() {
     _debounce?.cancel();
-    _controller.dispose();
+    for (final c in _nwidControllers) {
+      c.dispose();
+    }
     super.dispose();
   }
 
@@ -106,15 +115,36 @@ class _ZeroTierViewState extends ConsumerState<ZeroTierView> {
 
   Future<void> _load() async {
     final cfg = await _readConfig();
-    final nwid = ((cfg['network-id'] as String?) ?? '').trim();
+    // 多网络字段优先；旧版单 network-id 配置回退兼容。
+    final ids = <String>[];
+    final rawList = cfg['network-ids'];
+    if (rawList is List) {
+      for (final e in rawList) {
+        final s = (e is String ? e : '').trim();
+        if (s.isNotEmpty) ids.add(s);
+      }
+    } else {
+      final legacy = ((cfg['network-id'] as String?) ?? '').trim();
+      if (legacy.isNotEmpty) ids.add(legacy);
+    }
     final planet = await _planetFile();
     _routeMode = _normalizeMode(cfg['route-mode'] as String?);
     _useCustomPlanet = (cfg['use-custom-planet'] as bool?) ?? false;
     _planetFileSize = await planet.exists() ? await planet.length() : -1;
-    _controller.text = nwid;
-    _status = nwid.isEmpty
+    for (final c in _nwidControllers) {
+      c.dispose();
+    }
+    _nwidControllers.clear();
+    for (final id in ids) {
+      _nwidControllers.add(TextEditingController(text: id));
+    }
+    if (_nwidControllers.isEmpty) {
+      // 始终保留一个空行供直接输入。
+      _nwidControllers.add(TextEditingController());
+    }
+    _status = ids.isEmpty
         ? 'ZeroTier disabled (mihomo only)'
-        : 'ZeroTier network: $nwid';
+        : 'ZeroTier networks: ${ids.join(', ')}';
     if (mounted) setState(() {});
   }
 
@@ -142,30 +172,75 @@ class _ZeroTierViewState extends ConsumerState<ZeroTierView> {
     }
   }
 
-  Future<void> _saveNwid(String value) async {
-    final nwid = value.trim();
-    // ZeroTier Network ID 必须是 16 位十六进制；非法值拒绝写入，避免
-    // Go core StartEngine 解析失败后悄悄退回纯 mihomo 模式。
-    final validNWID = RegExp(r'^[0-9a-fA-F]{16}$');
-    if (nwid.isNotEmpty && !validNWID.hasMatch(nwid)) {
-      setState(() {
-        _status = '无效：Network ID 必须是 16 位十六进制（当前 ${nwid.length} 位），未保存';
-      });
-      return;
+  /// 收集所有输入框 → 校验 → 写入 `network-ids`（并移除旧版单字段）。
+  Future<void> _saveNwids() async {
+    final ids = <String>[];
+    for (final c in _nwidControllers) {
+      final id = c.text.trim();
+      if (id.isEmpty) continue;
+      if (!_nwidRegExp.hasMatch(id)) {
+        setState(() {
+          _status = '无效：Network ID 必须是 16 位十六进制'
+              '（"$id" 为 ${id.length} 位），未保存';
+        });
+        return;
+      }
+      ids.add(id.toLowerCase());
+    }
+    // 去重（保持顺序）。
+    final seen = <String>{};
+    final uniq = <String>[];
+    for (final id in ids) {
+      if (seen.add(id)) uniq.add(id);
     }
     try {
-      if (nwid.isEmpty) {
-        await _writeConfig({'network-id': ''});
-        _status = 'ZeroTier disabled (mihomo only)';
-      } else {
-        await _writeConfig({'network-id': nwid});
-        _status = 'saved: $nwid — restart VPN to apply';
-      }
+      await _writeNetworkIds(uniq);
+      _status = uniq.isEmpty
+          ? 'ZeroTier disabled (mihomo only)'
+          : 'saved ${uniq.length} network(s) — restart VPN to apply';
       if (mounted) setState(() {});
     } catch (err) {
       _status = 'save failed: $err';
       if (mounted) setState(() {});
     }
+  }
+
+  /// 写回网络列表：空列表移除字段（= 禁用）；同时迁移掉旧版 network-id。
+  Future<void> _writeNetworkIds(List<String> ids) async {
+    final cfg = await _readConfig();
+    cfg.remove('network-id');
+    if (ids.isEmpty) {
+      cfg.remove('network-ids');
+    } else {
+      cfg['network-ids'] = ids;
+    }
+    final file = await _configFile();
+    if (cfg.isEmpty) {
+      if (await file.exists()) await file.delete();
+      return;
+    }
+    await file.writeAsString('${jsonEncode(cfg)}\n');
+  }
+
+  void _scheduleSave() {
+    _debounce?.cancel();
+    _debounce = Timer(const Duration(milliseconds: 800), _saveNwids);
+  }
+
+  void _addNwid() {
+    setState(() {
+      _nwidControllers.add(TextEditingController());
+    });
+  }
+
+  Future<void> _removeNwid(int i) async {
+    _debounce?.cancel();
+    setState(() {
+      _nwidControllers[i].dispose();
+      _nwidControllers.removeAt(i);
+    });
+    // 删除即生效保存（空列表 = 禁用）。
+    await _saveNwids();
   }
 
   // ---- private planet ----
@@ -366,21 +441,35 @@ class _ZeroTierViewState extends ConsumerState<ZeroTierView> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const SizedBox(height: 4),
-                TextField(
-                  controller: _controller,
-                  decoration: const InputDecoration(
-                    hintText: '16 位十六进制 Network ID（留空 = 禁用）',
-                    isDense: true,
-                    border: OutlineInputBorder(),
+                Text(
+                  '可同时加入多个网络（每行一个 Network ID），'
+                  '全部留空 = 禁用。',
+                  style: theme.textTheme.bodySmall,
+                ),
+                const SizedBox(height: 8),
+                for (int i = 0; i < _nwidControllers.length; i++)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: TextField(
+                      controller: _nwidControllers[i],
+                      decoration: InputDecoration(
+                        hintText: '16 位十六进制 Network ID',
+                        isDense: true,
+                        border: const OutlineInputBorder(),
+                        suffixIcon: IconButton(
+                          icon: const Icon(Icons.close, size: 18),
+                          tooltip: '删除此行',
+                          onPressed: () => _removeNwid(i),
+                        ),
+                      ),
+                      style: theme.textTheme.bodyMedium,
+                      onChanged: (_) => _scheduleSave(),
+                    ),
                   ),
-                  style: theme.textTheme.bodyMedium,
-                  onChanged: (value) {
-                    _debounce?.cancel();
-                    _debounce = Timer(
-                      const Duration(milliseconds: 800),
-                      () => _saveNwid(value),
-                    );
-                  },
+                TextButton.icon(
+                  onPressed: _addNwid,
+                  icon: const Icon(Icons.add),
+                  label: const Text('添加网络'),
                 ),
                 if (_status.isNotEmpty) ...[
                   const SizedBox(height: 4),
@@ -504,7 +593,8 @@ class _ZeroTierViewState extends ConsumerState<ZeroTierView> {
           ),
           const _StepText(
             '2. 在本页填写 ZeroTier Network ID（可在 ZeroTier Central '
-            '或你的自建控制器创建网络后获得）。',
+            '或你的自建控制器创建网络后获得）；需要进入多个内网时，'
+            '点「添加网络」逐行填入每个网络的 ID。',
           ),
           const _StepText(
             '3. 自建网络：导入你的私有 planet 文件并开启「使用私有 Planet」。',
@@ -514,7 +604,7 @@ class _ZeroTierViewState extends ConsumerState<ZeroTierView> {
           ),
           const _StepText(
             '5. 修改 Network ID / Planet / 路由模式后需重启 VPN 才生效；'
-            '路由模式选「纯 Clash」或清空 Network ID 后为纯 mihomo 模式。',
+            '路由模式选「纯 Clash」或清空全部 Network ID 后为纯 mihomo 模式。',
           ),
         ],
       ),

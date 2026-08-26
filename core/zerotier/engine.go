@@ -36,6 +36,8 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -102,7 +104,7 @@ type Engine struct {
 	wg     sync.WaitGroup
 
 	snapMu sync.RWMutex
-	snap   Snapshot
+	snaps  map[uint64]Snapshot // per-network snapshots (multi-network)
 	gen    uint64
 
 	routes *RouteTable
@@ -284,6 +286,7 @@ func StartEngine(cfg Config, protect func(int), homeDir string) (*Engine, error)
 		stopCh:  make(chan struct{}),
 		routes:  NewRouteTable(),
 		frames:  make(chan Frame, frameChannelCap),
+		snaps:   make(map[uint64]Snapshot),
 	}
 	// 纯 ZeroTier 模式需要全隧道：放行 ZT 下发的默认路由（0.0.0.0/0）。
 	// 其余模式下默认路由仍被丢弃，避免把 mihomo 的流量全部抢走。
@@ -383,9 +386,9 @@ func (e *Engine) start(cfg Config, protect func(int), homeDir string) error {
 	C.flclashtier_zt_set_socket_fd(C.int(fd))
 	Infof("[ZT] UDP socket bound on %s fd=%d", conn.LocalAddr().String(), fd)
 
-	nwid, err := ParseNWID(cfg.NetworkID)
-	if err != nil {
-		return err
+	ids := cfg.AllNetworkIDs()
+	if len(ids) == 0 {
+		return errors.New("no ZeroTier network-id configured")
 	}
 
 	e.wg.Add(3)
@@ -393,11 +396,27 @@ func (e *Engine) start(cfg Config, protect func(int), homeDir string) error {
 	go e.backgroundLoop()
 	go e.engineLoop()
 
-	rc := C.flclashtier_zt_join(C.uint64_t(nwid))
-	if rc != 0 {
-		return fmt.Errorf("join 0x%016x rc=%d", nwid, int(rc))
+	// Multi-network: one node joins every configured network. Individual
+	// failures (bad id / join rc) warn and continue; the engine only fails
+	// when NO network could be joined.
+	joined := 0
+	for _, id := range ids {
+		nwid, err := ParseNWID(id)
+		if err != nil {
+			Warnf("[ZT] skip invalid network-id %q: %v", id, err)
+			continue
+		}
+		rc := C.flclashtier_zt_join(C.uint64_t(nwid))
+		if rc != 0 {
+			Warnf("[ZT] join 0x%016x rc=%d", nwid, int(rc))
+			continue
+		}
+		joined++
+		Infof("[ZT] join 0x%016x rc=%d", nwid, int(rc))
 	}
-	Infof("[ZT] join 0x%016x rc=%d", nwid, int(rc))
+	if joined == 0 {
+		return fmt.Errorf("no ZeroTier network could be joined (%d configured)", len(ids))
+	}
 	return nil
 }
 
@@ -502,7 +521,7 @@ func (e *Engine) Stop() {
 
 	e.routes.Clear()
 	e.snapMu.Lock()
-	e.snap = Snapshot{}
+	e.snaps = nil
 	e.gen = 0
 	e.snapMu.Unlock()
 
@@ -549,14 +568,27 @@ func (e *Engine) boundPort() int {
 
 // ---- FrameSender implementation ----
 
-// Current returns the latest config snapshot.
-func (e *Engine) Current() (Snapshot, bool) {
+// Snapshots returns one snapshot per joined network.
+func (e *Engine) Snapshots() []Snapshot {
 	e.snapMu.RLock()
 	defer e.snapMu.RUnlock()
-	if e.snap.Nwid == 0 || e.snap.Mac == 0 {
+	out := make([]Snapshot, 0, len(e.snaps))
+	for _, s := range e.snaps {
+		out = append(out, s)
+	}
+	return out
+}
+
+// SnapshotFor returns the snapshot of one network (ok=false while the
+// network has no config yet, e.g. still REQUESTING_CONFIGURATION).
+func (e *Engine) SnapshotFor(nwid uint64) (Snapshot, bool) {
+	e.snapMu.RLock()
+	defer e.snapMu.RUnlock()
+	s, ok := e.snaps[nwid]
+	if !ok || s.Mac == 0 {
 		return Snapshot{}, false
 	}
-	return e.snap, true
+	return s, true
 }
 
 // MatchRoute returns the managed route covering addr.
@@ -757,11 +789,11 @@ func (e *Engine) engineLoop() {
 	}
 }
 
-// refreshSnapshot exports the C snapshot when the generation changed and
-// rebuilds the route table. Returns a one-line route summary ("" = unchanged).
+// refreshSnapshot exports all C snapshots when the generation changed,
+// updates the per-network map and rebuilds the merged route table. Returns a
+// one-line per-network summary ("" = unchanged).
 func (e *Engine) refreshSnapshot() string {
-	var cs C.flclashtier_zt_snapshot
-	gen := uint64(C.flclashtier_zt_snapshot_export(&cs))
+	gen := uint64(C.flclashtier_zt_snapshot_generation())
 
 	e.snapMu.RLock()
 	curGen := e.gen
@@ -770,6 +802,59 @@ func (e *Engine) refreshSnapshot() string {
 		return ""
 	}
 
+	snaps := make(map[uint64]Snapshot)
+	n := int(C.flclashtier_zt_snapshot_count())
+	for i := 0; i < n; i++ {
+		var cs C.flclashtier_zt_snapshot
+		if uint64(C.flclashtier_zt_snapshot_export_at(C.int(i), &cs)) == 0 {
+			continue
+		}
+		snap := parseSnapshot(&cs)
+		snaps[snap.Nwid] = snap
+	}
+
+	// Merge the managed routes of every OK network into one table; each
+	// route is tagged with its owning nwid so SendIP can pick the right
+	// network identity per destination.
+	var merged []Route
+	for _, snap := range snaps {
+		if snap.Status != statusOK || snap.Nwid == 0 {
+			continue
+		}
+		for _, r := range snap.Routes {
+			r.Nwid = snap.Nwid
+			merged = append(merged, r)
+		}
+	}
+
+	e.snapMu.Lock()
+	e.snaps = snaps
+	e.gen = gen
+	e.snapMu.Unlock()
+
+	if len(merged) > 0 {
+		e.routes.Set(merged)
+	} else {
+		e.routes.Clear()
+	}
+
+	// Deterministic summary: per network, sorted by nwid.
+	nwids := make([]uint64, 0, len(snaps))
+	for id := range snaps {
+		nwids = append(nwids, id)
+	}
+	sort.Slice(nwids, func(i, j int) bool { return nwids[i] < nwids[j] })
+	parts := make([]string, 0, len(nwids))
+	for _, id := range nwids {
+		s := snaps[id]
+		parts = append(parts, fmt.Sprintf("0x%016x status=%d mac=%012x assigned=%d routes=%d",
+			id, s.Status, s.Mac, len(s.Assigned), len(s.Routes)))
+	}
+	return fmt.Sprintf("[ZT] %d network(s): %s", len(snaps), strings.Join(parts, "; "))
+}
+
+// parseSnapshot converts one C snapshot struct into its Go view.
+func parseSnapshot(cs *C.flclashtier_zt_snapshot) Snapshot {
 	snap := Snapshot{
 		Nwid:   uint64(cs.nwid),
 		Status: int(cs.status),
@@ -830,21 +915,9 @@ func (e *Engine) refreshSnapshot() string {
 				via = netip.AddrFrom16(vb)
 			}
 		}
-		snap.Routes = append(snap.Routes, Route{Prefix: pfx, Via: via, Flags: uint16(r.flags), Metric: uint16(r.metric)})
+		snap.Routes = append(snap.Routes, Route{Nwid: snap.Nwid, Prefix: pfx, Via: via, Flags: uint16(r.flags), Metric: uint16(r.metric)})
 	}
-
-	e.snapMu.Lock()
-	e.snap = snap
-	e.gen = gen
-	e.snapMu.Unlock()
-
-	if snap.Status == statusOK && snap.Nwid != 0 {
-		e.routes.Set(snap.Routes)
-	} else {
-		e.routes.Clear()
-	}
-	return fmt.Sprintf("[ZT] config op=%d status=%d rev=%d mac=%012x assigned=%d routes=%d",
-		int(cs.operation), snap.Status, uint64(cs.netconfRevision), snap.Mac, len(snap.Assigned), len(snap.Routes))
+	return snap
 }
 
 func allZero(b []byte) bool {

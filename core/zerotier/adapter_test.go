@@ -6,28 +6,48 @@ import (
 	"time"
 )
 
+// fakeNWID is the network id used by the single-network tests.
+const fakeNWID = uint64(0xb6079f73c6c0eb31)
+
 // fakeSender is an in-memory FrameSender for adapter tests.
 type fakeSender struct {
-	snap   Snapshot
+	snaps  []Snapshot
 	routes *RouteTable
 	frames []Frame
 	subs   []uint64
 }
 
+// newFakeSender builds a single-network fake (keeps legacy tests concise).
 func newFakeSender(mac uint64, assigned []AssignedAddr, routes []Route) *fakeSender {
-	rt := NewRouteTable()
-	rt.Set(routes)
-	return &fakeSender{
-		snap:   Snapshot{Nwid: 0xb6079f73c6c0eb31, Status: 1, Mac: mac, MTU: 2800, Assigned: assigned, Routes: routes},
-		routes: rt,
-	}
+	return newFakeSenderMulti([]Snapshot{{
+		Nwid: fakeNWID, Status: 1, Mac: mac, MTU: 2800, Assigned: assigned, Routes: routes,
+	}})
 }
 
-func (f *fakeSender) Current() (Snapshot, bool) {
-	if f.snap.Nwid == 0 {
-		return Snapshot{}, false
+// newFakeSenderMulti builds a multi-network fake: each snapshot's routes are
+// tagged with that snapshot's nwid and merged into one route table, exactly
+// like the engine's refreshSnapshot does.
+func newFakeSenderMulti(snaps []Snapshot) *fakeSender {
+	rt := NewRouteTable()
+	var merged []Route
+	for i := range snaps {
+		for j := range snaps[i].Routes {
+			snaps[i].Routes[j].Nwid = snaps[i].Nwid
+			merged = append(merged, snaps[i].Routes[j])
+		}
 	}
-	return f.snap, true
+	rt.Set(merged)
+	return &fakeSender{snaps: snaps, routes: rt}
+}
+
+func (f *fakeSender) Snapshots() []Snapshot { return f.snaps }
+func (f *fakeSender) SnapshotFor(nwid uint64) (Snapshot, bool) {
+	for _, s := range f.snaps {
+		if s.Nwid == nwid && s.Mac != 0 {
+			return s, true
+		}
+	}
+	return Snapshot{}, false
 }
 func (f *fakeSender) MatchRoute(addr netip.Addr) *Route { return f.routes.Match(addr) }
 func (f *fakeSender) SendFrame(fr Frame) error {
@@ -100,7 +120,7 @@ func TestAdapterARPResolveFlow(t *testing.T) {
 
 	// 2. ARP reply arrives -> learn + flush queued data frame
 	reply := BuildARPReply(peerMAC, mustAddr("192.168.196.81"), localMAC, mustAddr("192.168.196.88"))
-	a.HandleFrame(Frame{Nwid: fs.snap.Nwid, SrcMAC: peerMAC, DstMAC: localMAC, EtherType: EtherTypeARP, Data: reply})
+	a.HandleFrame(Frame{Nwid: fakeNWID, SrcMAC: peerMAC, DstMAC: localMAC, EtherType: EtherTypeARP, Data: reply})
 	if a.PendingLen() != 0 {
 		t.Fatalf("pending=%d want 0 after flush", a.PendingLen())
 	}
@@ -122,7 +142,7 @@ func TestAdapterARPRequestForUs(t *testing.T) {
 
 	// peer asks who-has 192.168.196.88 (our IP) -> we must reply
 	req := BuildARPRequest(peerMAC, mustAddr("192.168.196.81"), mustAddr("192.168.196.88"))
-	a.HandleFrame(Frame{Nwid: fs.snap.Nwid, SrcMAC: peerMAC, DstMAC: BroadcastMAC, EtherType: EtherTypeARP, Data: req})
+	a.HandleFrame(Frame{Nwid: fakeNWID, SrcMAC: peerMAC, DstMAC: BroadcastMAC, EtherType: EtherTypeARP, Data: req})
 	if len(fs.frames) != 1 {
 		t.Fatalf("frames=%d want 1 (ARP reply)", len(fs.frames))
 	}
@@ -141,7 +161,7 @@ func TestAdapterARPRequestNotForUs(t *testing.T) {
 		[]Route{{Prefix: mustPrefix("192.168.196.0/24")}})
 	a := NewAdapter(fs)
 	req := BuildARPRequest(0x123456789abc, mustAddr("192.168.196.81"), mustAddr("192.168.196.99"))
-	a.HandleFrame(Frame{Nwid: fs.snap.Nwid, SrcMAC: 0x123456789abc, DstMAC: BroadcastMAC, EtherType: EtherTypeARP, Data: req})
+	a.HandleFrame(Frame{Nwid: fakeNWID, SrcMAC: 0x123456789abc, DstMAC: BroadcastMAC, EtherType: EtherTypeARP, Data: req})
 	if len(fs.frames) != 0 {
 		t.Fatalf("frames=%d want 0 (not our IP)", len(fs.frames))
 	}
@@ -158,7 +178,7 @@ func TestAdapterIPv4InboundToTUN(t *testing.T) {
 	a.Out = func(pkt []byte) { got = append([]byte(nil), pkt...) }
 
 	pkt := fakeIPv4Ping("192.168.196.81", "192.168.196.88")
-	a.HandleFrame(Frame{Nwid: fs.snap.Nwid, SrcMAC: 0x123456789abc, DstMAC: 0x0a0000000001, EtherType: EtherTypeIPv4, Data: pkt})
+	a.HandleFrame(Frame{Nwid: fakeNWID, SrcMAC: 0x123456789abc, DstMAC: 0x0a0000000001, EtherType: EtherTypeIPv4, Data: pkt})
 	if got == nil || len(got) == 0 {
 		t.Fatal("Out not called")
 	}
@@ -317,7 +337,7 @@ func TestAdapterIPv6NeighborFlow(t *testing.T) {
 
 	// 2. NA arrives -> learn + flush
 	na := BuildNA(peerMAC, dst, dst, peerMAC)
-	a.HandleFrame(Frame{Nwid: fs.snap.Nwid, SrcMAC: peerMAC, DstMAC: localMAC, EtherType: EtherTypeIPv6, Data: na})
+	a.HandleFrame(Frame{Nwid: fakeNWID, SrcMAC: peerMAC, DstMAC: localMAC, EtherType: EtherTypeIPv6, Data: na})
 	if a.PendingLen() != 0 {
 		t.Fatalf("pending=%d want 0", a.PendingLen())
 	}
@@ -332,7 +352,7 @@ func TestAdapterIPv6NeighborFlow(t *testing.T) {
 	a.ndp.Learn(dst, peerMAC) // not needed; NS handler answers directly
 	nsForUs := BuildNS(peerMAC, dst, mustAddr("fd00::88"))
 	before := len(fs.frames)
-	a.HandleFrame(Frame{Nwid: fs.snap.Nwid, SrcMAC: peerMAC, DstMAC: SolicitedNodeMAC(mustAddr("fd00::88")), EtherType: EtherTypeIPv6, Data: nsForUs})
+	a.HandleFrame(Frame{Nwid: fakeNWID, SrcMAC: peerMAC, DstMAC: SolicitedNodeMAC(mustAddr("fd00::88")), EtherType: EtherTypeIPv6, Data: nsForUs})
 	if len(fs.frames) != before+1 {
 		t.Fatalf("frames=%d want %d (NA reply)", len(fs.frames), before+1)
 	}
@@ -347,3 +367,112 @@ func TestAdapterIPv6NeighborFlow(t *testing.T) {
 		t.Fatal("NS source should be learned")
 	}
 }
+
+// ---- multi-network ----
+
+// fakeNWID2 is a second network for the multi-network tests.
+const fakeNWID2 = uint64(0x8056c2e21c000001)
+
+// twoNetworkFake builds a node joined into two disjoint networks with
+// distinct MACs and assigned addresses.
+func twoNetworkFake() *fakeSender {
+	return newFakeSenderMulti([]Snapshot{
+		{
+			Nwid: fakeNWID, Status: 1, Mac: 0x0a0000000001, MTU: 2800,
+			Assigned: []AssignedAddr{{Addr: mustAddr("192.168.196.88"), Bits: 24}},
+			Routes:   []Route{{Prefix: mustPrefix("192.168.196.0/24")}},
+		},
+		{
+			Nwid: fakeNWID2, Status: 1, Mac: 0x0b0000000002, MTU: 2800,
+			Assigned: []AssignedAddr{{Addr: mustAddr("10.7.0.5"), Bits: 24}},
+			Routes:   []Route{{Prefix: mustPrefix("10.7.0.0/24")}},
+		},
+	})
+}
+
+func TestAdapterMultiNetworkPerDestinationIdentity(t *testing.T) {
+	fs := twoNetworkFake()
+	a := NewAdapter(fs)
+	a.arp.Learn(mustAddr("192.168.196.81"), 0x123456789abc)
+	a.arp.Learn(mustAddr("10.7.0.9"), 0x987654321cba)
+
+	// destination in network 1 -> network 1's nwid + MAC
+	if err := a.SendIP(mustAddr("192.168.196.81"), fakeIPv4Ping("192.168.196.88", "192.168.196.81")); err != nil {
+		t.Fatal(err)
+	}
+	// destination in network 2 -> network 2's nwid + MAC
+	if err := a.SendIP(mustAddr("10.7.0.9"), fakeIPv4Ping("10.7.0.5", "10.7.0.9")); err != nil {
+		t.Fatal(err)
+	}
+	if len(fs.frames) != 2 {
+		t.Fatalf("frames=%d want 2", len(fs.frames))
+	}
+	f1, f2 := fs.frames[0], fs.frames[1]
+	if f1.Nwid != fakeNWID || f1.SrcMAC != 0x0a0000000001 {
+		t.Fatalf("frame1 net=%016x src=%012x want net1 identity", f1.Nwid, f1.SrcMAC)
+	}
+	if f2.Nwid != fakeNWID2 || f2.SrcMAC != 0x0b0000000002 {
+		t.Fatalf("frame2 net=%016x src=%012x want net2 identity", f2.Nwid, f2.SrcMAC)
+	}
+}
+
+func TestAdapterMultiNetworkARPReplyUsesOwningNetwork(t *testing.T) {
+	fs := twoNetworkFake()
+	a := NewAdapter(fs)
+
+	// who-has 10.7.0.5 (our IP on network 2) arrives ON network 2.
+	req := BuildARPRequest(0x987654321cba, mustAddr("10.7.0.9"), mustAddr("10.7.0.5"))
+	a.HandleFrame(Frame{Nwid: fakeNWID2, SrcMAC: 0x987654321cba, DstMAC: BroadcastMAC, EtherType: EtherTypeARP, Data: req})
+	if len(fs.frames) != 1 {
+		t.Fatalf("frames=%d want 1 (ARP reply)", len(fs.frames))
+	}
+	reply := fs.frames[0]
+	if reply.Nwid != fakeNWID2 || reply.SrcMAC != 0x0b0000000002 {
+		t.Fatalf("reply net=%016x src=%012x want net2 identity", reply.Nwid, reply.SrcMAC)
+	}
+	// Same query arriving on network 1 must NOT be answered (IP not assigned there).
+	req1 := BuildARPRequest(0x123456789abc, mustAddr("192.168.196.81"), mustAddr("10.7.0.5"))
+	a.HandleFrame(Frame{Nwid: fakeNWID, SrcMAC: 0x123456789abc, DstMAC: BroadcastMAC, EtherType: EtherTypeARP, Data: req1})
+	if len(fs.frames) != 1 {
+		t.Fatalf("frames=%d want 1 (cross-network query must be ignored)", len(fs.frames))
+	}
+}
+
+func TestAdapterMultiNetworkSubscriptions(t *testing.T) {
+	fs := twoNetworkFake()
+	a := NewAdapter(fs)
+	a.Cleanup(time.Now())
+	a.Cleanup(time.Now()) // second call must not duplicate
+
+	// one resolution group per assigned address per network (1 + 1).
+	if len(fs.subs) != 2 {
+		t.Fatalf("subs=%d want 2", len(fs.subs))
+	}
+	if a.SubscribedGroups() != 2 {
+		t.Fatalf("subscribed=%d want 2", a.SubscribedGroups())
+	}
+}
+
+func TestAdapterSnapshotForUnconfiguredNetwork(t *testing.T) {
+	// Network 2 is joined but still REQUESTING_CONFIGURATION (no MAC yet).
+	fs := newFakeSenderMulti([]Snapshot{
+		{
+			Nwid: fakeNWID, Status: 1, Mac: 0x0a0000000001, MTU: 2800,
+			Assigned: []AssignedAddr{{Addr: mustAddr("192.168.196.88"), Bits: 24}},
+			Routes:   []Route{{Prefix: mustPrefix("192.168.196.0/24")}},
+		},
+		{
+			Nwid: fakeNWID2, Status: 0, Mac: 0,
+			Routes: []Route{{Prefix: mustPrefix("10.7.0.0/24")}},
+		},
+	})
+	if _, ok := fs.SnapshotFor(fakeNWID2); ok {
+		t.Fatal("SnapshotFor must fail for a network without config")
+	}
+	a := NewAdapter(fs)
+	// Route exists but the owning network has no identity yet -> ErrNoConfig.
+	if err := a.SendIP(mustAddr("10.7.0.9"), fakeIPv4Ping("10.7.0.5", "10.7.0.9")); err != ErrNoConfig {
+		t.Fatalf("SendIP err=%v want ErrNoConfig", err)
+	}
+}
+

@@ -14,6 +14,8 @@
 #include <cstring>
 #include <cstdio>
 #include <chrono>
+#include <iterator>
+#include <map>
 #include <mutex>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -160,10 +162,14 @@ static void virtualNetworkFrameFunction(ZT_Node* node, void* uptr, void* tptr,
 }
 
 // ---------------------------------------------------------------------------
-// Config snapshot (thread-safe; C-side deep copy, Go pulls)
+// Config snapshot (thread-safe; C-side deep copy, Go pulls).
+// Multi-network: one snapshot PER joined network, keyed by nwid. The ZT core
+// fires virtualNetworkConfigFunction per network; UP/CONFIG_UPDATE upserts,
+// DOWN/DESTROY (or a NULL config) removes. std::map keeps deterministic
+// nwid-ordered iteration for the export_at accessor.
 // ---------------------------------------------------------------------------
 static std::mutex g_snapMutex;
-static flclashtier_zt_snapshot g_snapshot;
+static std::map<uint64_t, flclashtier_zt_snapshot> g_snapshots;
 static uint64_t g_generation = 0;
 
 static uint8_t sockaddrFamily(const struct sockaddr_storage* addr) {
@@ -196,40 +202,47 @@ static void copySockaddr(const struct sockaddr_storage* addr, uint8_t* out) {
 static void updateSnapshotLocked(uint64_t nwid,
                                  enum ZT_VirtualNetworkConfigOperation op,
                                  const ZT_VirtualNetworkConfig* config) {
-  memset(&g_snapshot, 0, sizeof(g_snapshot));
-  g_snapshot.nwid = nwid;
-  g_snapshot.operation = static_cast<int>(op);
-  if (config) {
-    g_snapshot.status = static_cast<int>(config->status);
-    g_snapshot.netconfRevision = config->netconfRevision;
-    g_snapshot.mac = config->mac;
-    g_snapshot.mtu = config->mtu;
-    unsigned int na = config->assignedAddressCount;
-    if (na > FLCLASHTIER_ZT_MAX_ASSIGNED) na = FLCLASHTIER_ZT_MAX_ASSIGNED;
-    g_snapshot.assignedCount = na;
-    for (unsigned int i = 0; i < na; ++i) {
-      flclashtier_zt_assigned* dst = &g_snapshot.assigned[i];
-      const struct sockaddr_storage& src = config->assignedAddresses[i];
-      memset(dst, 0, sizeof(*dst));
-      dst->family = sockaddrFamily(&src);
-      dst->prefixLen = sockaddrPrefixLen(&src);
-      copySockaddr(&src, dst->addr);
-    }
-    unsigned int rc = config->routeCount;
-    if (rc > FLCLASHTIER_ZT_MAX_ROUTES) rc = FLCLASHTIER_ZT_MAX_ROUTES;
-    g_snapshot.routeCount = rc;
-    for (unsigned int i = 0; i < rc; ++i) {
-      flclashtier_zt_route* dst = &g_snapshot.routes[i];
-      const ZT_VirtualNetworkRoute& src = config->routes[i];
-      memset(dst, 0, sizeof(*dst));
-      dst->family = sockaddrFamily(&src.target);
-      dst->prefixLen = sockaddrPrefixLen(&src.target);
-      copySockaddr(&src.target, dst->target);
-      copySockaddr(&src.via, dst->via);
-      dst->flags = src.flags;
-      dst->metric = src.metric;
-    }
+  if (op == ZT_VIRTUAL_NETWORK_CONFIG_OPERATION_DOWN ||
+      op == ZT_VIRTUAL_NETWORK_CONFIG_OPERATION_DESTROY ||
+      config == NULL) {
+    g_snapshots.erase(nwid);
+    ++g_generation;
+    return;
   }
+  flclashtier_zt_snapshot snap;
+  memset(&snap, 0, sizeof(snap));
+  snap.nwid = nwid;
+  snap.operation = static_cast<int>(op);
+  snap.status = static_cast<int>(config->status);
+  snap.netconfRevision = config->netconfRevision;
+  snap.mac = config->mac;
+  snap.mtu = config->mtu;
+  unsigned int na = config->assignedAddressCount;
+  if (na > FLCLASHTIER_ZT_MAX_ASSIGNED) na = FLCLASHTIER_ZT_MAX_ASSIGNED;
+  snap.assignedCount = na;
+  for (unsigned int i = 0; i < na; ++i) {
+    flclashtier_zt_assigned* dst = &snap.assigned[i];
+    const struct sockaddr_storage& src = config->assignedAddresses[i];
+    memset(dst, 0, sizeof(*dst));
+    dst->family = sockaddrFamily(&src);
+    dst->prefixLen = sockaddrPrefixLen(&src);
+    copySockaddr(&src, dst->addr);
+  }
+  unsigned int rc = config->routeCount;
+  if (rc > FLCLASHTIER_ZT_MAX_ROUTES) rc = FLCLASHTIER_ZT_MAX_ROUTES;
+  snap.routeCount = rc;
+  for (unsigned int i = 0; i < rc; ++i) {
+    flclashtier_zt_route* dst = &snap.routes[i];
+    const ZT_VirtualNetworkRoute& src = config->routes[i];
+    memset(dst, 0, sizeof(*dst));
+    dst->family = sockaddrFamily(&src.target);
+    dst->prefixLen = sockaddrPrefixLen(&src.target);
+    copySockaddr(&src.target, dst->target);
+    copySockaddr(&src.via, dst->via);
+    dst->flags = src.flags;
+    dst->metric = src.metric;
+  }
+  g_snapshots[nwid] = snap;
   ++g_generation;
 }
 
@@ -253,11 +266,24 @@ static void eventCallback(ZT_Node* node, void* uptr, void* tptr,
 // C ABI implementation
 // ---------------------------------------------------------------------------
 
-uint64_t flclashtier_zt_snapshot_export(flclashtier_zt_snapshot* out) {
-  if (!out) return 0;
+uint64_t flclashtier_zt_snapshot_generation(void) {
   std::lock_guard<std::mutex> lock(g_snapMutex);
-  memcpy(out, &g_snapshot, sizeof(g_snapshot));
   return g_generation;
+}
+
+int flclashtier_zt_snapshot_count(void) {
+  std::lock_guard<std::mutex> lock(g_snapMutex);
+  return static_cast<int>(g_snapshots.size());
+}
+
+uint64_t flclashtier_zt_snapshot_export_at(int idx, flclashtier_zt_snapshot* out) {
+  if (!out || idx < 0) return 0;
+  std::lock_guard<std::mutex> lock(g_snapMutex);
+  if (static_cast<size_t>(idx) >= g_snapshots.size()) return 0;
+  auto it = g_snapshots.begin();
+  std::advance(it, idx);
+  memcpy(out, &it->second, sizeof(*out));
+  return it->first;
 }
 
 void flclashtier_zt_set_socket_fd(int fd) {
@@ -380,6 +406,13 @@ void flclashtier_zt_node_delete(flclashtier_zt_node* node) {
     s_node = NULL;
   }
   ZT_Node_delete(reinterpret_cast<ZT_Node*>(node));
+  // Node gone: drop all per-network snapshots so a later engine never sees
+  // stale configs from the destroyed node.
+  {
+    std::lock_guard<std::mutex> snapLock(g_snapMutex);
+    g_snapshots.clear();
+    ++g_generation;
+  }
 }
 
 uint64_t flclashtier_zt_node_address(void) {

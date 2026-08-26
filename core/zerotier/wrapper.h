@@ -67,7 +67,9 @@ int flclashtier_zt_has_custom_planet(void);
 
 // ---------------------------------------------------------------------------
 // Network config snapshot (routes / assigned addresses / status / MAC).
-// C-side, thread-safe. Go pulls a copy via flclashtier_zt_snapshot_export().
+// C-side, thread-safe. Multi-network: one snapshot PER joined network,
+// keyed by nwid; Go pulls them via the generation/count/export_at accessors
+// below (export_at iterates in ascending nwid order).
 // ---------------------------------------------------------------------------
 #define FLCLASHTIER_ZT_MAX_ROUTES 128
 #define FLCLASHTIER_ZT_MAX_ASSIGNED 16
@@ -100,9 +102,17 @@ typedef struct {
     flclashtier_zt_route routes[FLCLASHTIER_ZT_MAX_ROUTES];
 } flclashtier_zt_snapshot;
 
-// Export the latest snapshot into caller-provided memory (Go-owned buffer).
-// Returns the snapshot generation (increments on every config event).
-uint64_t flclashtier_zt_snapshot_export(flclashtier_zt_snapshot* out);
+// Snapshot generation: increments on EVERY config event (upsert or removal)
+// across all networks. Go polls this to detect changes cheaply.
+uint64_t flclashtier_zt_snapshot_generation(void);
+
+// Number of networks currently holding a snapshot (joined + configured).
+int flclashtier_zt_snapshot_count(void);
+
+// Export the snapshot at index idx (0..count-1, ascending nwid order) into
+// caller-provided memory (Go-owned buffer). Returns that snapshot's nwid,
+// or 0 when idx is out of range.
+uint64_t flclashtier_zt_snapshot_export_at(int idx, flclashtier_zt_snapshot* out);
 
 // ---------------------------------------------------------------------------
 // Wire plane (M1-3)

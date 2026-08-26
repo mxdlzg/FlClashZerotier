@@ -52,9 +52,10 @@ type Adapter struct {
 	// Set via SetTUNAddress; used for SNAT/DNAT at the L3 boundary.
 	tunIPv4 netip.Addr
 
-	// subscribed tracks multicast groups already subscribed (mac<<32|adi),
-	// so per-tick maintenance does not spam the core.
-	subscribed map[uint64]bool
+	// subscribed tracks multicast groups already subscribed per network
+	// ({nwid, mac<<32|adi}), so per-tick maintenance does not spam the core.
+	// The same group MAC on two networks counts as two subscriptions.
+	subscribed map[[2]uint64]bool
 
 	// MaxFrame is the ZT network MTU (from config). Larger IPv4 packets are
 	// fragmented before entering ZT; larger IPv6 packets are dropped with a
@@ -70,7 +71,7 @@ func NewAdapter(eng FrameSender) *Adapter {
 		arp:        NewNeighTable(neighTTL),
 		ndp:        NewNeighTable(neighTTL),
 		pending:    NewPendingQueue(),
-		subscribed: make(map[uint64]bool),
+		subscribed: make(map[[2]uint64]bool),
 	}
 }
 
@@ -89,39 +90,40 @@ func (a *Adapter) Cleanup(now time.Time) {
 }
 
 // ensureSubscriptions subscribes this node to the ARP (IPv4) / NDP (IPv6)
-// resolution multicast groups of its assigned addresses, exactly like the
-// official ZeroTier clients do. Without this, other members' "who-has
-// <our-ip>" queries are never delivered to us (ZeroTier turns plain ARP
-// broadcasts into targeted multicasts).
+// resolution multicast groups of its assigned addresses on EVERY joined
+// network, exactly like the official ZeroTier clients do. Without this,
+// other members' "who-has <our-ip>" queries are never delivered to us
+// (ZeroTier turns plain ARP broadcasts into targeted multicasts).
 func (a *Adapter) ensureSubscriptions() {
-	cfg, ok := a.eng.Current()
-	if !ok || cfg.Nwid == 0 {
-		return
-	}
-	for _, aa := range cfg.Assigned {
-		var mac uint64
-		var adi uint32
-		switch {
-		case aa.Addr.Is4():
-			mac = BroadcastMAC
-			b := aa.Addr.As4()
-			adi = uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
-		case aa.Addr.Is6():
-			mac = SolicitedNodeMAC(aa.Addr)
-			adi = 0
-		default:
+	for _, cfg := range a.eng.Snapshots() {
+		if cfg.Nwid == 0 {
 			continue
 		}
-		key := mac<<32 | uint64(adi)
-		if a.subscribed[key] {
-			continue
+		for _, aa := range cfg.Assigned {
+			var mac uint64
+			var adi uint32
+			switch {
+			case aa.Addr.Is4():
+				mac = BroadcastMAC
+				b := aa.Addr.As4()
+				adi = uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+			case aa.Addr.Is6():
+				mac = SolicitedNodeMAC(aa.Addr)
+				adi = 0
+			default:
+				continue
+			}
+			key := [2]uint64{cfg.Nwid, mac<<32 | uint64(adi)}
+			if a.subscribed[key] {
+				continue
+			}
+			if err := a.eng.SubscribeMulticast(cfg.Nwid, mac, adi); err != nil {
+				Warnf("[ZT] multicastSubscribe net=0x%016x mac=%012x adi=%08x: %v", cfg.Nwid, mac, adi, err)
+				continue
+			}
+			a.subscribed[key] = true
+			Infof("[ZT] subscribed %s resolution group (net=0x%016x mac=%012x adi=%08x)", aa.Addr, cfg.Nwid, mac, adi)
 		}
-		if err := a.eng.SubscribeMulticast(cfg.Nwid, mac, adi); err != nil {
-			Warnf("[ZT] multicastSubscribe mac=%012x adi=%08x: %v", mac, adi, err)
-			continue
-		}
-		a.subscribed[key] = true
-		Infof("[ZT] subscribed %s resolution group (mac=%012x adi=%08x)", aa.Addr, mac, adi)
 	}
 }
 
@@ -146,14 +148,17 @@ func (a *Adapter) NdpLen() int { return a.ndp.Len() }
 
 // SendIP routes one TUN IP packet into the ZT network. The packet MUST be
 // inside a ZT managed route — otherwise ErrNoRoute is returned and the
-// caller (flow router) sends it to mihomo instead. Returns nil if the packet
-// was sent or queued for MAC resolution.
+// caller (flow router) sends it to mihomo instead. Multi-network: the route
+// match picks the owning network, whose snapshot (MAC / assigned IP / MTU)
+// is used for SNAT and framing. Returns nil if the packet was sent or queued
+// for MAC resolution.
 func (a *Adapter) SendIP(dst netip.Addr, pkt []byte) error {
-	if a.eng.MatchRoute(dst) == nil {
+	r := a.eng.MatchRoute(dst)
+	if r == nil {
 		return ErrNoRoute
 	}
-	cfg, ok := a.eng.Current()
-	if !ok || cfg.Mac == 0 || cfg.Nwid == 0 {
+	cfg, ok := a.eng.SnapshotFor(r.Nwid)
+	if !ok || cfg.Mac == 0 {
 		return ErrNoConfig
 	}
 	if dst.Is4() {
@@ -270,7 +275,8 @@ func (a *Adapter) handleARP(fr Frame) {
 	}
 	a.arp.Learn(ap.SenderIP, fr.SrcMAC)
 	if ap.Op == ARPRequest {
-		cfg, ok := a.eng.Current()
+		// Reply with the identity of the network the request arrived on.
+		cfg, ok := a.eng.SnapshotFor(fr.Nwid)
 		if ok && cfg.Mac != 0 && hasAssigned4(cfg.Assigned, ap.TargetIP) {
 			reply := BuildARPReply(cfg.Mac, ap.TargetIP, fr.SrcMAC, ap.SenderIP)
 			_ = a.eng.SendFrame(Frame{Nwid: fr.Nwid, SrcMAC: cfg.Mac, DstMAC: fr.SrcMAC, EtherType: EtherTypeARP, Data: reply})
@@ -289,7 +295,7 @@ func (a *Adapter) handleIPv6(fr Frame) {
 	case IsNeighborSolicitation(fr.Data):
 		a.ndp.Learn(src, fr.SrcMAC)
 		target := NSTarget(fr.Data)
-		cfg, ok2 := a.eng.Current()
+		cfg, ok2 := a.eng.SnapshotFor(fr.Nwid)
 		if ok2 && cfg.Mac != 0 && target.IsValid() && hasAssigned6(cfg.Assigned, target) {
 			na := BuildNA(cfg.Mac, target, target, cfg.Mac)
 			_ = a.eng.SendFrame(Frame{Nwid: fr.Nwid, SrcMAC: cfg.Mac, DstMAC: fr.SrcMAC, EtherType: EtherTypeIPv6, Data: na})
@@ -350,17 +356,20 @@ func (a *Adapter) snatOut(cfg Snapshot, pkt []byte) []byte {
 
 // forwardDnat rewrites the IPv4 destination address of an inbound ZT packet
 // from the ZT-assigned IP back to the TUN internal address before writing it
-// to the TUN. Counterpart of snatOut.
+// to the TUN. Counterpart of snatOut. Multi-network: scan every joined
+// network's assigned addresses for the packet's destination.
 func (a *Adapter) forwardDnat(pkt []byte) {
 	if a.tunIPv4.IsValid() {
-		if cfg, ok := a.eng.Current(); ok {
-			if local := firstAssigned4(cfg.Assigned); local.IsValid() && local != a.tunIPv4 {
-				if dst, ok := IPv4Dst(pkt); ok && dst == local {
-					if rw := rewriteIPv4SrcDst(pkt, netip.Addr{}, a.tunIPv4); rw != nil {
-						Infof("[ZT] dnat %s -> %s (ZT->TUN)", local, a.tunIPv4)
-						a.forward(rw)
-						return
-					}
+		if dst, ok := IPv4Dst(pkt); ok {
+			for _, cfg := range a.eng.Snapshots() {
+				local := firstAssigned4(cfg.Assigned)
+				if !local.IsValid() || local != dst || local == a.tunIPv4 {
+					continue
+				}
+				if rw := rewriteIPv4SrcDst(pkt, netip.Addr{}, a.tunIPv4); rw != nil {
+					Infof("[ZT] dnat %s -> %s (ZT->TUN)", local, a.tunIPv4)
+					a.forward(rw)
+					return
 				}
 			}
 		}

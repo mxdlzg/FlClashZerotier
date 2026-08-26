@@ -54,7 +54,7 @@ func Start(fd int, stack string, address, dns string, protect func(int)) *sing_t
 	}
 
 	// FlClashTier M1 数据面：
-	//   - zerotier.json 配置了 network-id → flowRouter（ZT 分支 + mihomo 分支）
+	//   - zerotier.json 配置了 network-id（可多个）→ flowRouter（ZT 分支 + mihomo 分支）
 	//   - 否则 → M0 pump（纯透传，零改动，mihomo-only 场景与上游一致）
 	// mihomo 分支在两种模式下完全相同：socketpair 一端交给 sing_tun。
 	var dp stopper
@@ -99,7 +99,7 @@ func Start(fd int, stack string, address, dns string, protect func(int)) *sing_t
 		} else {
 			dp = fr
 			mihomoFd = fr.mihomoFd
-			log.Infoln("TUN: ZeroTier flow router active (network %s route-mode %s)", cfg.NetworkID, ztMode)
+			log.Infoln("TUN: ZeroTier flow router active (networks [%s] route-mode %s)", strings.Join(cfg.AllNetworkIDs(), ", "), ztMode)
 		}
 	}
 	if mihomoFd == 0 {

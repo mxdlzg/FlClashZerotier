@@ -91,11 +91,16 @@ func ActiveRouteMode() RouteMode {
 // Config is the content of <homeDir>/zerotier.json.
 //
 //	{
-//	  "network-id": "b6079f73c6c0eb31",
+//	  "network-ids": ["b6079f73c6c0eb31", "8056c2e21c000001"],
 //	  "port": 0,
 //	  "use-custom-planet": true,
 //	  "route-mode": "coexist"
 //	}
+//
+// network-ids is the multi-network list: every entry is joined on the same
+// ZeroTier node, so one VPN session enters all listed intranets. The legacy
+// single "network-id" field is still accepted and merged in for backward
+// compatibility; see AllNetworkIDs.
 //
 // port is the local UDP port for ZeroTier wire traffic (0 = default 9994).
 // Omit for default.
@@ -104,15 +109,41 @@ func ActiveRouteMode() RouteMode {
 // planet to the private planet stored in <homeDir>/zerotier-planet.custom
 // (self-hosted root set, e.g. a self-built ztncui/planet network). The
 // Flutter settings page imports the planet file; the engine installs it
-// before creating the ZT node.
+// before creating the ZT node. All joined networks share this planet (the
+// planet is node-wide).
 //
 // route-mode selects the traffic split between ZeroTier and Clash
 // (see RouteMode). Omit for the default coexist mode.
 type Config struct {
+	NetworkIDs      []string  `json:"network-ids,omitempty"`
 	NetworkID       string    `json:"network-id"`
 	Port            int       `json:"port,omitempty"`
 	UseCustomPlanet bool      `json:"use-custom-planet,omitempty"`
 	RouteMode       RouteMode `json:"route-mode,omitempty"`
+}
+
+// AllNetworkIDs merges the multi-network list with the legacy single field,
+// trimming, lowercasing and deduplicating. Empty strings are dropped. The
+// order is preserved (network-ids first), which only affects log output.
+func (c *Config) AllNetworkIDs() []string {
+	if c == nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var out []string
+	add := func(s string) {
+		s = strings.ToLower(strings.TrimSpace(s))
+		if s == "" || seen[s] {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	for _, id := range c.NetworkIDs {
+		add(id)
+	}
+	add(c.NetworkID)
+	return out
 }
 
 // CustomPlanetPath returns the absolute path of the private planet file.
@@ -144,8 +175,9 @@ func LoadConfig(homeDir string) (*Config, error) {
 	return cfg, nil
 }
 
-// Enabled reports whether ZeroTier should be started (network-id present).
-func (c *Config) Enabled() bool { return c != nil && c.NetworkID != "" }
+// Enabled reports whether ZeroTier should be started (at least one
+// network-id present).
+func (c *Config) Enabled() bool { return c != nil && len(c.AllNetworkIDs()) > 0 }
 
 // LoadCustomPlanet reads and validates the private planet file. A missing
 // file returns (nil, nil) so callers can distinguish "not imported yet"
