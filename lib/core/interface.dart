@@ -60,6 +60,8 @@ mixin CoreInterface {
 
   FutureOr<int> getMemory();
 
+  FutureOr<Map<String, dynamic>?> getZeroTierStatus();
+
   FutureOr<void> resetTraffic();
 
   FutureOr<void> startLog();
@@ -370,5 +372,13 @@ abstract class CoreHandlerInterface with CoreInterface {
   @override
   Future<int> getMemory() async {
     return await _invokeMethod<int>(method: CoreMethod.getMemory) ?? 0;
+  }
+
+  @override
+  Future<Map<String, dynamic>?> getZeroTierStatus() async {
+    return await invokeMethod<Map<String, dynamic>>(
+      method: CoreMethod.getZeroTierStatus,
+      timeout: const Duration(seconds: 2),
+    );
   }
 }

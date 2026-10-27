@@ -56,6 +56,50 @@ class _BackupAndRestoreState extends ConsumerState<BackupAndRestore>
     );
   }
 
+  Future<String?> _askBackupPassword() async {
+    final saved = await preferences.getBackupPassword();
+    final password = await globalState.showCommonDialog<String>(
+      child: BackupPasswordDialog(initial: saved ?? ''),
+    );
+    if (password == null || password.isEmpty) return null;
+    await preferences.setBackupPassword(password);
+    return password;
+  }
+
+  Future<void> _encryptBackupFile(String path, String password) async {
+    final file = File(path);
+    final bytes = await file.readAsBytes();
+    final encrypted = await encryptZipBytesAsync(bytes, password);
+    await file.writeAsBytes(encrypted, flush: true);
+  }
+
+  Future<bool> _decryptBackupFileIfNeeded() async {
+    final backupFile = File(await appPath.backupFilePath);
+    if (!await backupFile.exists()) return false;
+    final bytes = await backupFile.readAsBytes();
+    if (!isEncryptedBackup(bytes)) return true;
+    final saved = await preferences.getBackupPassword();
+    final password = await globalState.showCommonDialog<String>(
+      child: BackupPasswordDialog(
+        initial: saved ?? '',
+        title: '备份已加密，请输入密码',
+        requireConfirm: false,
+      ),
+    );
+    if (password == null || password.isEmpty) return false;
+    try {
+      final zip = await decryptBackupBytesAsync(bytes, password);
+      await backupFile.writeAsBytes(zip, flush: true);
+      return true;
+    } on FormatException {
+      globalState.showMessage(
+        title: currentAppLocalizations.restore,
+        message: const TextSpan(text: '密码错误或备份文件已损坏'),
+      );
+      return false;
+    }
+  }
+
   Future<void> _backupOnWebDAV() async {
     final appLocalizations = context.appLocalizations;
     final res = await globalState.loadingRun<bool>(
@@ -70,6 +114,11 @@ class _BackupAndRestoreState extends ConsumerState<BackupAndRestore>
         if (path.isEmpty) {
           return false;
         }
+        final password = await _askBackupPassword();
+        if (password == null) {
+          return false;
+        }
+        await _encryptBackupFile(path, password);
         return client.backup(path);
       },
       tag: LoadingTag.backup_restore,
@@ -91,6 +140,9 @@ class _BackupAndRestoreState extends ConsumerState<BackupAndRestore>
           return false;
         }
         await client.restore();
+        if (!await _decryptBackupFileIfNeeded()) {
+          return false;
+        }
         await globalState.container
             .read(backupActionProvider.notifier)
             .restore(option);
@@ -124,6 +176,11 @@ class _BackupAndRestoreState extends ConsumerState<BackupAndRestore>
         if (path.isEmpty) {
           return false;
         }
+        final password = await _askBackupPassword();
+        if (password == null) {
+          return false;
+        }
+        await _encryptBackupFile(path, password);
         final value = await picker.saveFileWithPath(
           utils.getBackupFileName(),
           path,
@@ -149,6 +206,9 @@ class _BackupAndRestoreState extends ConsumerState<BackupAndRestore>
     await File(path).safeCopy(await appPath.backupFilePath);
     final res = await globalState.loadingRun<bool>(
       () async {
+        if (!await _decryptBackupFileIfNeeded()) {
+          return false;
+        }
         await globalState.container
             .read(backupActionProvider.notifier)
             .restore(option);
@@ -381,6 +441,126 @@ class _RestoreOptionsDialogState extends State<RestoreOptionsDialog> {
             title: Text(appLocalizations.restoreAllData),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class BackupPasswordDialog extends StatefulWidget {
+  final String initial;
+  final String title;
+  final bool requireConfirm;
+
+  const BackupPasswordDialog({
+    super.key,
+    required this.initial,
+    this.title = '设置备份加密密码',
+    this.requireConfirm = true,
+  });
+
+  @override
+  State<BackupPasswordDialog> createState() => _BackupPasswordDialogState();
+}
+
+class _BackupPasswordDialogState extends State<BackupPasswordDialog> {
+  late final TextEditingController _passwordController;
+  final _confirmController = TextEditingController();
+  final _obscure = ValueNotifier<bool>(true);
+  final _formKey = GlobalKey<FormState>();
+
+  @override
+  void initState() {
+    super.initState();
+    _passwordController = TextEditingController(text: widget.initial);
+  }
+
+  @override
+  void dispose() {
+    _passwordController.dispose();
+    _confirmController.dispose();
+    _obscure.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    if (!_formKey.currentState!.validate()) return;
+    Navigator.pop(context, _passwordController.text);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final appLocalizations = context.appLocalizations;
+    return CommonDialog(
+      title: widget.title,
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: Text(appLocalizations.cancel),
+        ),
+        TextButton(
+          onPressed: _submit,
+          child: Text(appLocalizations.confirm),
+        ),
+      ],
+      child: Form(
+        key: _formKey,
+        child: Wrap(
+          runSpacing: 16,
+          children: [
+            ValueListenableBuilder(
+              valueListenable: _obscure,
+              builder: (_, obscure, _) {
+                return TextFormField(
+                  controller: _passwordController,
+                  obscureText: obscure,
+                  autofocus: true,
+                  decoration: InputDecoration(
+                    prefixIcon: const Icon(Icons.password),
+                    border: const OutlineInputBorder(),
+                    suffixIcon: IconButton(
+                      icon: Icon(
+                        obscure ? Icons.visibility : Icons.visibility_off,
+                      ),
+                      onPressed: () => _obscure.value = !_obscure.value,
+                    ),
+                    labelText: appLocalizations.password,
+                  ),
+                  validator: (value) {
+                    if (value == null || value.isEmpty) {
+                      return appLocalizations.emptyTip(
+                        appLocalizations.password,
+                      );
+                    }
+                    return null;
+                  },
+                );
+              },
+            ),
+            if (widget.requireConfirm)
+              TextFormField(
+                controller: _confirmController,
+                obscureText: true,
+                decoration: const InputDecoration(
+                  prefixIcon: Icon(Icons.password),
+                  border: OutlineInputBorder(),
+                  labelText: '确认密码',
+                ),
+                validator: (value) {
+                  if (value != _passwordController.text) {
+                    return '两次输入不一致';
+                  }
+                  return null;
+                },
+              ),
+            if (widget.requireConfirm)
+              Text(
+                '备份将以 AES-256 加密导出（含 ZeroTier 节点身份）。'
+                '密码会保存在本机用于 WebDAV 自动恢复；'
+                '忘记密码将无法解密备份。',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+          ],
+        ),
       ),
     );
   }

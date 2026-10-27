@@ -1,4 +1,5 @@
 export 'app_localizations.dart';
+export 'backup_crypto.dart';
 export 'color.dart';
 export 'compute.dart';
 export 'constant.dart';

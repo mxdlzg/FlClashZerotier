@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -136,6 +137,9 @@ func (th *TunHandler) initHook() {
 		if zerotier.DialViaTunnel(network, address) {
 			return nil
 		}
+		if reason := zerotier.ExplainTunnelMiss(network, address); reason != "" && shouldWarnTunnelMiss(address) {
+			log.Warnln("[ZT] dial %s leaves via physical network: %s", address, reason)
+		}
 		return conn.Control(func(fd uintptr) {
 			tunHandler.handleProtect(int(fd))
 		})
@@ -159,10 +163,27 @@ var (
 	errBlocked = errors.New("blocked")
 	tunHandler *TunHandler
 
+	warnTunnelMissMu   sync.Mutex
+	warnTunnelMissLast = map[string]time.Time{}
+
 	// ztForcedDirect 标记纯 ZeroTier 模式是否把 tunnel 强制成了 Direct，
 	// 退出该模式/TUN 关闭时用来还原配置文件里的 mode。
 	ztForcedDirect bool
 )
+
+// shouldWarnTunnelMiss throttles the clash-over-zerotier bypass warning to one
+// line per destination address per 30s — retries of a dead node dial per
+// attempt and would otherwise flood the log.
+func shouldWarnTunnelMiss(address string) bool {
+	warnTunnelMissMu.Lock()
+	defer warnTunnelMissMu.Unlock()
+	now := time.Now()
+	if last, ok := warnTunnelMissLast[address]; ok && now.Sub(last) < 30*time.Second {
+		return false
+	}
+	warnTunnelMissLast[address] = now
+	return true
+}
 
 // syncZerotierTunnelMode 按当前路由模式校正 mihomo 的 tunnel mode：
 // 纯 ZeroTier 模式下，ZT 未覆盖的回落流量必须直连（不走代理链）；

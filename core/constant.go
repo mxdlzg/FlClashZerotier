@@ -100,6 +100,7 @@ const (
 	getExternalProviderMethod      CoreMethod = "getExternalProvider"
 	getCountryCodeMethod           CoreMethod = "getCountryCode"
 	getMemoryMethod                CoreMethod = "getMemory"
+	getZeroTierStatusMethod        CoreMethod = "getZeroTierStatus"
 	updateGeoDataMethod            CoreMethod = "updateGeoData"
 	updateExternalProviderMethod   CoreMethod = "updateExternalProvider"
 	sideLoadExternalProviderMethod CoreMethod = "sideLoadExternalProvider"

@@ -261,6 +261,9 @@ func handleMethodCall(call *MethodCall, response MethodResponse) {
 			response.success(value)
 		})
 		return
+	case getZeroTierStatusMethod:
+		handleGetZeroTierStatus(response)
+		return
 	case clearEffectMethod:
 		var profileId int64
 		if !decodeMethodArguments(call, response, &profileId) {

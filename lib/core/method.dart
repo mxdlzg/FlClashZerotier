@@ -32,6 +32,7 @@ enum CoreMethod {
   stopListener,
   getCountryCode,
   getMemory,
+  getZeroTierStatus,
   crash,
   setupConfig,
   clearEffect,

@@ -34,6 +34,16 @@ class Preferences {
     await preferences?.setInt('version', version);
   }
 
+  Future<String?> getBackupPassword() async {
+    final preferences = await sharedPreferencesCompleter.future;
+    return preferences?.getString('backupPassword');
+  }
+
+  Future<void> setBackupPassword(String password) async {
+    final preferences = await sharedPreferencesCompleter.future;
+    await preferences?.setString('backupPassword', password);
+  }
+
   Future<void> saveShareState(SharedState shareState) async {
     final preferences = await sharedPreferencesCompleter.future;
     await preferences?.setString('sharedState', json.encode(shareState));

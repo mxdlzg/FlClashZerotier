@@ -3,11 +3,14 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:collection/collection.dart';
 import 'package:dio/dio.dart';
 import 'package:fl_clash/common/common.dart';
+import 'package:fl_clash/core/controller.dart';
 import 'package:fl_clash/state.dart';
 import 'package:fl_clash/widgets/widgets.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path/path.dart' as p;
 
@@ -54,15 +57,35 @@ class _ZeroTierViewState extends ConsumerState<ZeroTierView> {
   int _planetFileSize = -1; // -1 = 未导入
   bool _planetBusy = false;
 
+  Map<String, dynamic>? _ztStatus;
+  Timer? _ztPoller;
+
   @override
   void initState() {
     super.initState();
     _load();
+    _refreshZtStatus();
+    _ztPoller = Timer.periodic(
+      const Duration(seconds: 3),
+      (_) => _refreshZtStatus(),
+    );
+  }
+
+  Future<void> _refreshZtStatus() async {
+    try {
+      final data = await coreController.getZeroTierStatus();
+      if (mounted && data != null) {
+        setState(() => _ztStatus = data);
+      }
+    } catch (_) {
+      // core 未初始化/方法不可用时静默，下一次轮询自然恢复。
+    }
   }
 
   @override
   void dispose() {
     _debounce?.cancel();
+    _ztPoller?.cancel();
     for (final c in _nwidControllers) {
       c.dispose();
     }
@@ -435,6 +458,11 @@ class _ZeroTierViewState extends ConsumerState<ZeroTierView> {
               style: theme.textTheme.bodySmall,
             ),
           ),
+          if (_ztStatus != null)
+            _ZeroTierStatusCard(
+              status: _ztStatus!,
+              onRefresh: _refreshZtStatus,
+            ),
           ListTile(
             title: const Text('ZeroTier Network ID'),
             subtitle: Column(
@@ -624,6 +652,163 @@ class _StepText extends StatelessWidget {
       child: Text(
         text,
         style: Theme.of(context).textTheme.bodySmall,
+      ),
+    );
+  }
+}
+
+class _ZeroTierStatusCard extends StatelessWidget {
+  const _ZeroTierStatusCard({required this.status, required this.onRefresh});
+
+  final Map<String, dynamic> status;
+  final VoidCallback onRefresh;
+
+  static const Map<int, String> _networkStatusNames = {
+    0: 'REQUESTING_CONFIGURATION',
+    1: 'OK',
+    2: 'ACCESS_DENIED',
+    3: 'NOT_FOUND',
+    4: 'PORT_ERROR',
+  };
+
+  static const Map<int, String> _networkStatusHints = {
+    0: '正在向控制器申请配置——planet 或网络可能不可达，稍后自动重试。',
+    2: '控制器未授权本节点：请在控制器（ztncui / ZeroTier Central）的 '
+        'Peer 列表勾选上面的节点地址并 Authorize。',
+    3: '控制器上不存在该 Network ID，检查是否填错或网络已被删除。',
+  };
+
+  String get _statusText {
+    final state = (status['state'] as String?) ?? 'STOPPED';
+    if (state != 'RUNNING') {
+      final configured = status['configured'] == true;
+      if (!configured) {
+        return '未启用（Network ID 为空）';
+      }
+      return '引擎 $state — 启动/重启 VPN 后连接';
+    }
+    final networks = (status['networks'] as List?) ?? const [];
+    if (networks.isEmpty) {
+      return '引擎 RUNNING — 尚未加入任何网络';
+    }
+    final first = networks.first;
+    if (first is Map) {
+      final s = (first['status'] as num?)?.toInt() ?? -1;
+      return _networkStatusNames[s] ?? 'status=$s';
+    }
+    return 'RUNNING';
+  }
+
+  Color _statusColor(BuildContext context) {
+    final state = (status['state'] as String?) ?? 'STOPPED';
+    if (state != 'RUNNING') {
+      return Colors.grey;
+    }
+    final networks = (status['networks'] as List?) ?? const [];
+    var hasDenied = false;
+    var hasRequesting = false;
+    for (final n in networks) {
+      if (n is! Map) continue;
+      switch ((n['status'] as num?)?.toInt()) {
+        case 1:
+          return Colors.green;
+        case 2:
+          hasDenied = true;
+        case 0:
+          hasRequesting = true;
+      }
+    }
+    if (hasDenied) return Theme.of(context).colorScheme.error;
+    if (hasRequesting) return Colors.orange;
+    return Colors.grey;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final state = (status['state'] as String?) ?? 'STOPPED';
+    final node = (status['node'] as String?) ?? '';
+    final networks =
+        ((status['networks'] as List?) ?? const [])
+            .whereType<Map>()
+            .toList();
+    final hint = networks
+        .map(
+          (n) => _networkStatusHints[(n['status'] as num?)?.toInt() ?? -1],
+        )
+        .whereType<String>()
+        .firstOrNull;
+    return Card(
+      margin: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Container(
+                  width: 10,
+                  height: 10,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: _statusColor(context),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    _statusText,
+                    style: theme.textTheme.titleSmall,
+                  ),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.refresh, size: 18),
+                  tooltip: '立即刷新',
+                  onPressed: onRefresh,
+                ),
+              ],
+            ),
+            if (node.isNotEmpty && state == 'RUNNING') ...[
+              const SizedBox(height: 4),
+              Row(
+                children: [
+                  Expanded(
+                    child: SelectableText(
+                      '节点地址 $node',
+                      style: theme.textTheme.bodySmall,
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.copy, size: 16),
+                    tooltip: '复制节点地址',
+                    onPressed: () {
+                      Clipboard.setData(ClipboardData(text: node));
+                    },
+                  ),
+                ],
+              ),
+            ],
+            for (final n in networks)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text(
+                  '${n['nwid']}: ${(n['assigned'] as List?)?.join(', ') ?? ''}'
+                  '  routes: ${(n['routes'] as List?)?.join(', ') ?? ''}',
+                  style: theme.textTheme.bodySmall,
+                ),
+              ),
+            if (hint != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                hint,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.error,
+                ),
+              ),
+            ],
+          ],
+        ),
       ),
     );
   }

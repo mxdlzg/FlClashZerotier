@@ -1,3 +1,19 @@
+## v1.0.0 (fork line starts here)
+
+- ZeroTier status card in Settings → ZeroTier: engine state, node address
+  (one-tap copy for controller authorization), per-network status
+  (REQUESTING / OK / ACCESS_DENIED / NOT_FOUND) with actionable hints,
+  assigned IPs and managed routes. Auto-refreshes every 3 s.
+
+- clash-over-zerotier: when a private-network outbound cannot enter the
+  ZeroTier tunnel, a throttled warning now states why (engine stopped,
+  node not authorized, address not covered by any managed route).
+
+- Backups are now password-encrypted (PBKDF2-HMAC-SHA256 + AES-256-CBC +
+  HMAC-SHA256). Password is remembered for WebDAV auto-restore; restoring
+  an encrypted backup prompts for the password. Unencrypted (v0.9.2)
+  backups still restore normally.
+
 ## v0.9.2
 
 - Backup/restore now includes ZeroTier: `zerotier.json`, custom planet file and

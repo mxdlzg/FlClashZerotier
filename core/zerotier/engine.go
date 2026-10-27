@@ -157,6 +157,41 @@ func DialViaTunnel(network, address string) bool {
 	return CoversAddr(addr)
 }
 
+// ExplainTunnelMiss returns a human-readable reason why an outbound dial to
+// address is NOT routed via ZeroTier in clash-over-zerotier mode, or "" when
+// no explanation applies (not in that mode, or the destination is not a
+// private-network literal). Used to annotate "no route to host" failures on
+// LAN-hosted proxy nodes; throttled by the caller.
+func ExplainTunnelMiss(network, address string) string {
+	if ActiveRouteMode() != RouteModeClashOverZerotier {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return ""
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return ""
+	}
+	isPrivate := addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast()
+	if !isPrivate {
+		return ""
+	}
+	e := currentEngine()
+	switch {
+	case e == nil:
+		return "ZeroTier engine not running (network-id empty or VPN not restarted after config change)"
+	case e.getState() != StateRunning:
+		return "ZeroTier engine is " + e.getState().String()
+	case !e.Ready():
+		return "ZeroTier joined but no managed routes yet — check controller: node authorized (REQUESTING_CONFIGURATION/ACCESS_DENIED), managed route covers " + host
+	case e.MatchRoute(addr) == nil:
+		return "address " + host + " is not covered by any ZeroTier managed route"
+	}
+	return ""
+}
+
 var (
 	globalEngineMu sync.Mutex
 	globalEngine   *Engine // non-nil while an Engine exists (any state)

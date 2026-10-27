@@ -54,6 +54,11 @@ jobs:
         working-directory: core
         run: CGO_ENABLED=0 go test ./zerotier/
 
+      - name: Dart unit tests (backup crypto)
+        run: |
+          flutter pub get
+          flutter test test/common/backup_crypto_test.dart
+
       - name: Install Android NDK r28c (28.2.13676358)
         run: |
           yes | ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager --install "ndk;28.2.13676358" --sdk_root=${ANDROID_HOME} > /dev/null 2>&1
