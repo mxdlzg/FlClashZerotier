@@ -1,3 +1,19 @@
+## v0.9.2
+
+- Backup/restore now includes ZeroTier: `zerotier.json`, custom planet file and
+  `zerotier-identity.secret` are exported in the backup zip and written back to
+  HomeDir on restore — the node address survives migration/reinstall, so the
+  controller does not need to re-authorize the node.
+
+- CI: grant `contents: write` so Publish Release can create GitHub Releases.
+  Release builds pass `--dart-define=APP_ENV=stable` (no PRE banner).
+
+- Point the in-app update check at `mxdlzg/FlClashZerotier` instead of upstream.
+
+- Upstream multi-platform desktop `build.yaml` (Windows/macOS + Telegram +
+  upstream release notes) is now manual-only; tag releases run solely
+  `build-apk.yml`.
+
 ## v0.9.1
 
 - ZeroTier: support private planet (self-hosted root set)
