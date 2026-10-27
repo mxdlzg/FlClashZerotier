@@ -37,8 +37,8 @@ Uint8List _pkcs7Unpad(Uint8List data) {
   return Uint8List.sublistView(data, 0, data.length - pad);
 }
 
-CbcBlockCipher _aesCbc(Uint8List key, Uint8List iv, bool forEncryption) {
-  return CbcBlockCipher(AESEngine())
+CBCBlockCipher _aesCbc(Uint8List key, Uint8List iv, bool forEncryption) {
+  return CBCBlockCipher(AESEngine())
     ..init(
       forEncryption,
       ParametersWithIV(KeyParameter(key), iv),
@@ -86,8 +86,9 @@ Uint8List encryptZipBytes(List<int> zipBytes, String password) {
   for (var off = 0; off < padded.length; off += 16) {
     cipher.processBlock(padded, off, cipherText, off);
   }
-  final mac = Hmac(SHA256Digest(), 64)
-      .process([...macKey, ...salt, ...iv, ...cipherText]);
+  final mac = HMac(SHA256Digest(), 64).process(
+    Uint8List.fromList([...macKey, ...salt, ...iv, ...cipherText]),
+  );
   final out = BytesBuilder(copy: false);
   out.add(utf8.encode(_encMagic));
   out.add(salt);
@@ -117,8 +118,9 @@ Uint8List decryptBackupBytes(List<int> data, String password) {
   final keys = _pbkdf2(password, salt, 48);
   final encKey = Uint8List.sublistView(keys, 0, 32);
   final macKey = Uint8List.sublistView(keys, 32, 48);
-  final expectMac = Hmac(SHA256Digest(), 64)
-      .process([...macKey, ...salt, ...iv, ...cipherText]);
+  final expectMac = HMac(SHA256Digest(), 64).process(
+    Uint8List.fromList([...macKey, ...salt, ...iv, ...cipherText]),
+  );
   var diff = 0;
   for (var i = 0; i < 32; i++) {
     diff |= expectMac[i] ^ mac[i];
