@@ -83,9 +83,9 @@ jobs:
       - name: Build APK
         run: |
           if [ "${{ github.event.inputs.target }}" = "all-abi" ]; then
-            flutter build apk --release
+            flutter build apk --release --dart-define=APP_ENV=stable
           else
-            flutter build apk --release --target-platform android-arm64
+            flutter build apk --release --dart-define=APP_ENV=stable --target-platform android-arm64
           fi
           ls -lh build/app/outputs/flutter-apk/
 
