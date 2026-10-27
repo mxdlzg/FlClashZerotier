@@ -143,3 +143,8 @@ const main = (config) => {
 
 const backupDatabaseName = 'database.sqlite';
 const configJsonName = 'config.json';
+const zerotierBackupFileNames = [
+  'zerotier.json',
+  'zerotier-planet.custom',
+  'zerotier-identity.secret',
+];

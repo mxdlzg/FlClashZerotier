@@ -524,6 +524,13 @@ Future<String> _backupTask<T>(
       },
     );
   }
+  final homeDirPath = await appPath.homeDirPath;
+  for (final name in zerotierBackupFileNames) {
+    final file = File(join(homeDirPath, name));
+    if (await file.exists()) {
+      await encoder.addFile(file, name);
+    }
+  }
   encoder.close();
   await tempConfigFile.safeDelete();
   await tempDBFile.safeDelete();
@@ -557,6 +564,12 @@ Future<MigrationData> _restoreTask(RootIsolateToken token) async {
   final restoreConfigFile = File(join(restoreDirPath, configJsonName));
   if (!await restoreConfigFile.exists()) {
     throw currentAppLocalizations.invalidBackupFile;
+  }
+  for (final name in zerotierBackupFileNames) {
+    final file = File(join(restoreDirPath, name));
+    if (await file.exists()) {
+      await file.safeCopy(join(homeDirPath, name));
+    }
   }
   final restoreConfigMap =
       json.decode(await restoreConfigFile.readAsString())
